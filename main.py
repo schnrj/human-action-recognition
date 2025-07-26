@@ -1,7 +1,8 @@
-# File: main.py
+
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from preprocessing.dataloading import load_data
 from preprocessing.preprocessing import preprocess_imu_data
@@ -96,7 +97,7 @@ plt.tight_layout()
 plt.show()
 
 # Step 11: Prepare IMU_CWT image for model input
-# Use all three channels if you want (3, 64, 64), or average if you want (1, 64, 64)
+
 imu_cwt = cwt_image  # Shape: (3, 64, 64)
 print("IMU CWT tensor shape (for model, before upsampling):", imu_cwt.shape)
 
@@ -107,4 +108,10 @@ upsampled_cwt = np.stack([
     resize(imu_cwt[i], (224, 224), mode='reflect', anti_aliasing=True)
     for i in range(imu_cwt.shape[0])
 ])
-print("Upsampled IMU CWT shape (for model):", upsampled_cwt.shape)  # Should be (3, 224, 224)
+print("Upsampled IMU CWT shape (for model):", upsampled_cwt.shape)  
+
+
+# FINAL: Prepare model-ready x_imu tensor
+x_imu = torch.tensor(upsampled_cwt, dtype=torch.float32).unsqueeze(0)  # (1, 3, 224, 224)
+print("Final x_imu tensor shape for model:", x_imu.shape)
+torch.save(x_imu, 'x_imu.pt')

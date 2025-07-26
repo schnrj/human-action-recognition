@@ -1,122 +1,103 @@
-# File: models/pyramid_model.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import librosa
-from dct import multi_frequency_compression
+import pywt
 
-def time_series_to_spectrogram(time_series, sample_rate=50, n_fft=256, hop_length=128):
-    ts = np.array(time_series, dtype=np.float32)
-    S = librosa.stft(ts, n_fft=n_fft, hop_length=hop_length)
-    S = np.abs(S)
-    S = librosa.amplitude_to_db(S, ref=np.max)
-    return S
+# --- Lightweight ECAM block ---
+class EfficientCrossAttentionModule(nn.Module):
+    def __init__(self, channel_dim):
+        super().__init__()
+        self.q_proj = nn.Linear(channel_dim, channel_dim)
+        self.k_proj = nn.Linear(channel_dim, channel_dim)
+        self.v_proj = nn.Linear(channel_dim, channel_dim)
+        self.out_proj = nn.Conv1d(channel_dim, channel_dim, kernel_size=1)
+        self.ln = nn.LayerNorm(channel_dim)
+    def forward(self, Q, K, V, orig):
+        # Q, K, V: [B, N, C]
+        attn = torch.matmul(self.q_proj(Q), self.k_proj(K).transpose(-2, -1)) / (Q.shape[-1] ** 0.5)
+        weights = F.softmax(attn, dim=-1)
+        context = torch.matmul(weights, self.v_proj(V))   # [B, N, C]
+        context = context.permute(0, 2, 1)
+        context = self.out_proj(context).permute(0, 2, 1) # [B, N, C]
+        fused = self.ln(orig + context)
+        return fused
 
+# --- HMCN backbone ---
 class PyramidMultiScaleCNN(nn.Module):
-    def __init__(self, input_channels):
+    def __init__(self, input_channels, groups=4):
         super().__init__()
-        self.conv3x3 = nn.Conv2d(input_channels, 64, 3, padding=1)
-        self.conv5x5 = nn.Conv2d(64 + input_channels, 128, 5, padding=2)
-        self.conv7x7 = nn.Conv2d(128 + input_channels, 256, 7, padding=3)
-
-        self.branch2_conv3x3 = nn.Conv2d(input_channels, 64, 3, padding=1)
-        self.branch2_conv5x5 = nn.Conv2d(64 + input_channels, 128, 5, padding=2)
-        self.branch2_conv7x7 = nn.Conv2d(128 + input_channels, 256, 7, padding=3)
-
-    def forward(self, x):
-        # Branch 1
-        b1_3 = F.relu(self.conv3x3(x))
-        cat1 = torch.cat([b1_3, x], dim=1)
-        b1_5 = F.relu(self.conv5x5(cat1))
-        cat1 = torch.cat([b1_5, x], dim=1)
-        b1_7 = F.relu(self.conv7x7(cat1))
-        out1 = torch.cat([b1_3, b1_5, b1_7], dim=1)
-
-        # Branch 2
-        b2_3 = F.relu(self.branch2_conv3x3(x))
-        cat2 = torch.cat([b2_3, x], dim=1)
-        b2_5 = F.relu(self.branch2_conv5x5(cat2))
-        cat2 = torch.cat([b2_5, x], dim=1)
-        b2_7 = F.relu(self.branch2_conv7x7(cat2))
-        out2 = torch.cat([b2_3, b2_5, b2_7], dim=1)
-
-        return torch.cat([out1, out2], dim=1)
-
-
-class PyramidAttentionModel(nn.Module):
-    def __init__(self, input_channels, n_classes, num_splits):
-        super().__init__()
-        assert num_splits >= 2 and num_splits % 2 == 0, "num_splits must be even and ≥2"
-        self.num_splits = num_splits
-        self.n_classes = n_classes
-        self.dropout = nn.Dropout(0.3)
-
-        # Compute per-split channels (with padding)
+        self.groups = groups
         padded = input_channels
-        if input_channels % num_splits != 0:
-            padded += num_splits - (input_channels % num_splits)
-        split_ch = padded // num_splits
-
-        # One PyramidMultiScaleCNN per split
-        self.groups = nn.ModuleList([
-            PyramidMultiScaleCNN(split_ch) for _ in range(num_splits)
+        if input_channels % groups != 0:
+            padded += groups - (input_channels % groups)
+        self.C_prime = padded // groups
+        self.depthwise_convs = nn.ModuleList([
+            nn.Conv2d(self.C_prime, self.C_prime, kernel_size=3, padding=1, groups=self.C_prime)
+            for _ in range(groups)
         ])
-
-        # GAP branch
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
-        # DCT params
-        self.k = 2
-        self.max_u = 5
-        self.max_v = 5
-
-        # Classifier for GAP branch
-        feature_size = (num_splits // 2) * 1792
-        self.classifier_gap = nn.Linear(feature_size, n_classes)
-
-        # We'll use LayerNorm for DCT branch instead of BatchNorm
-        self.layer_norm_dct = None
-        self.classifier_dct = None
-
+        self.pointwise_convs = nn.ModuleList([
+            nn.Conv2d(self.C_prime, self.C_prime, kernel_size=1)
+            for _ in range(groups)
+        ])
+    def convdwp(self, x, idx):
+        x = self.depthwise_convs[idx](x)
+        x = self.pointwise_convs[idx](x)
+        return F.relu(x)
     def forward(self, x):
-        B, C, H, W = x.size()
+        B, C, H, W = x.shape
+        if C % self.groups != 0:
+            pad_len = self.groups - (C % self.groups)
+            x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+        splits = torch.split(x, self.C_prime, dim=1)
+        outputs = [self.convdwp(split, idx) for idx, split in enumerate(splits)]
+        return torch.cat(outputs, dim=1)
 
-        # Pad channels if needed
-        if C % self.num_splits != 0:
-            pad = self.num_splits - (C % self.num_splits)
-            x = F.pad(x, (0,0,0,0,0,pad))
-            C += pad
+# ---- FINAL MULTIMODAL FUSION MODEL ----
+class MultimodalFrequencyAwareHAR(nn.Module):
+    def __init__(self, rgb_channels, depth_channels, imu_channels, num_classes=27, groups=4):
+        super().__init__()
+        self.hmcn_rgb = PyramidMultiScaleCNN(rgb_channels, groups=groups)
+        self.hmcn_depth = PyramidMultiScaleCNN(depth_channels, groups=groups)
+        self.hmcn_imu = PyramidMultiScaleCNN(imu_channels, groups=groups)
+        self.groups = groups
+        self.feature_channels = self.hmcn_rgb.C_prime * groups
+        # Efficient spatial reduction (critical for ECAM memory!)
+        self.reduce = nn.AdaptiveAvgPool2d((14, 14))  # Reduce feature map size before tokens
+        self.ecam_depth = EfficientCrossAttentionModule(self.feature_channels)
+        self.ecam_imu   = EfficientCrossAttentionModule(self.feature_channels)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(self.feature_channels * 3, num_classes)
 
-        # Split and process each part
-        parts = torch.split(x, C // self.num_splits, dim=1)
-        outs = [g(p) for g, p in zip(self.groups, parts)]
-        fused = torch.cat(outs, dim=1)
+    def forward(self, x_rgb, x_depth, x_imu):
+        # --- Step1: Feature extraction
+        F_rgb   = self.hmcn_rgb(x_rgb)       # [B, C', H', W']
+        F_depth = self.hmcn_depth(x_depth)
+        F_imu   = self.hmcn_imu(x_imu)
 
-        # GAP branch
-        gap_feat = self.gap(fused).view(B, -1)
-        gap_pred = self.classifier_gap(gap_feat)
+        # --- Step2: Spatial reduction to manageable grid size for ECAM
+        F_rgb   = self.reduce(F_rgb)
+        F_depth = self.reduce(F_depth)
+        F_imu   = self.reduce(F_imu)
 
-        # DCT branch
-        dct_feats = []
-        for i in range(B):
-            comp = multi_frequency_compression(fused[i], self.k, self.max_u, self.max_v)
-            dct_feats.append(comp)
-        dct_out = torch.stack([
-            torch.tensor(item) if isinstance(item, np.ndarray) else item
-            for item in dct_feats
-        ], dim=0).to(x.device)
-        dct_out = dct_out.view(B, -1)  # Flatten
+        B, C, H, W = F_rgb.shape
+        N = H * W
 
-        # Dynamically create LayerNorm & classifier
-        F_dct = dct_out.size(1)
-        if self.layer_norm_dct is None or self.layer_norm_dct.normalized_shape[0] != F_dct:
-            self.layer_norm_dct = nn.LayerNorm(F_dct).to(x.device)
-            self.classifier_dct = nn.Linear(F_dct, self.n_classes).to(x.device)
+        # --- Step3: Tokenize (flatten spatial, for attention)
+        F_rgb_tok   = F_rgb.flatten(2).transpose(1,2)   # [B, N, C]
+        F_depth_tok = F_depth.flatten(2).transpose(1,2) # [B, N, C]
+        F_imu_tok   = F_imu.flatten(2).transpose(1,2)   # [B, N, C]
 
-        dct_out = self.layer_norm_dct(dct_out)
-        dct_out = self.dropout(dct_out)
-        dct_pred = self.classifier_dct(dct_out)
+        # --- Step4: Cross-attention fusion (Depth←RGB and IMU←RGB)
+        Ffused_depth_tok = self.ecam_depth(F_depth_tok, F_rgb_tok, F_rgb_tok, F_depth_tok)
+        Ffused_imu_tok   = self.ecam_imu(F_imu_tok, F_rgb_tok, F_rgb_tok, F_imu_tok)
 
-        return gap_pred, dct_pred
+        # --- Step5: Untokenize
+        Ffused_depth = Ffused_depth_tok.transpose(1,2).reshape(B, C, H, W)
+        Ffused_imu   = Ffused_imu_tok.transpose(1,2).reshape(B, C, H, W)
+
+        # --- Step6: Late fusion and classification
+        F_final = torch.cat([F_rgb, Ffused_depth, Ffused_imu], dim=1) # [B, C*3, H, W]
+        pooled  = self.gap(F_final).flatten(1)
+        logits = self.classifier(pooled)
+        return logits
